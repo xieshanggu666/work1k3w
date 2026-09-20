@@ -35,10 +35,6 @@ const reviewNote = ref('')
 // 文档当前是否处于评审中（非管理员进入时只读锁定）
 const lockedByReview = ref(false)
 const activeReview = ref(null)
-// 无编辑权限（非拥有者/协作成员，且无有效限时协作授权，或授权已撤销/到期）
-const accessDenied = ref(false)
-// 当前用户的有效限时授权（限时协作成员可编辑，但不能发起评审）
-const activeGrant = ref(null)
 // 乐观锁基线：打开编辑器时的版本号与字段快照，保存时据此检测并合并并发修改
 const baseVersion = ref(null)
 const baseDoc = ref(null)
@@ -189,16 +185,9 @@ async function load() {
     const active = reviewStore.pendingReviewOf(route.params.id)
     activeReview.value = active
     lockedByReview.value = !!active && auth.user?.role !== ROLE.ADMIN
-    // 编辑权限：拥有者/固定协作成员/持有效限时协作授权；授权撤销或到期后进入即被收回
+    // 授权撤销/到期由下方 activeGrant / accessDenied 计算属性响应式收回，
+    // 这里只需确保授权表已加载（跨窗口变化也会由 access store 同步重读）
     await accessStore.loadAll()
-    activeGrant.value = d ? accessStore.grantOf(d.id, auth.user?.id) : null
-    accessDenied.value = d
-      ? !canEditDoc(d, { userId: auth.user?.id || GUEST_ID, role: auth.user?.role, grant: activeGrant.value, pendingReview: active })
-      : false
-    // 限时协作授权的只读成员没有「发起评审」通道，强制直接保存模式
-    if (activeGrant.value && auth.user?.role !== ROLE.ADMIN && auth.user?.role !== ROLE.EDITOR) {
-      submitMode.value = 'save'
-    }
     // 上次冲突时备份的未提交内容，重新进入编辑器时提示可恢复
     const b = localStorage.getItem(backupKey)
     if (b) { try { backup.value = JSON.parse(b) } catch { localStorage.removeItem(backupKey) } }
@@ -235,11 +224,27 @@ onBeforeUnmount(() => { clearTimeout(saveTimer.value); if (!isEdit.value) saveDr
 
 const canPublish = computed(() => title.value.trim() && categoryId.value)
 const userById = computed(() => Object.fromEntries(auth.users.map((u) => [u.id, u.name])))
+// 当前用户的有效限时授权：依赖 access store 的响应式授权表与到期时钟，
+// 授权被撤销/到期（含跨窗口操作）时即时变化
+const activeGrant = computed(() => (editingDoc.value ? accessStore.grantOf(editingDoc.value.id, auth.user?.id) : null))
+// 无编辑权限（非拥有者/协作成员，且无有效限时协作授权，或授权已撤销/到期）：随授权变化响应式锁定
+const accessDenied = computed(() => editingDoc.value
+  ? !canEditDoc(editingDoc.value, {
+      userId: auth.user?.id || GUEST_ID,
+      role: auth.user?.role,
+      grant: activeGrant.value,
+      pendingReview: activeReview.value
+    })
+  : false)
 // 仅靠限时协作授权获得编辑资格的只读成员：可直接保存，不走角色专属的「发起评审」通道
 const isGrantOnly = computed(() => {
   if (!editingDoc.value || !activeGrant.value) return false
   if (auth.user?.role === ROLE.ADMIN || auth.user?.role === ROLE.EDITOR) return false
   return editingDoc.value.ownerId !== auth.user?.id && !(editingDoc.value.editors || []).includes(auth.user?.id)
+})
+// 授权状态变化（撤销/到期/被授予）时同步提交模式：限时协作者强制直接保存，授权收回后恢复默认
+watch(activeGrant, (g) => {
+  if (g && auth.user?.role !== ROLE.ADMIN && auth.user?.role !== ROLE.EDITOR) submitMode.value = 'save'
 })
 // 可编辑：未被评审锁定、未被授权收回
 const editableNow = computed(() => !lockedByReview.value && !accessDenied.value)

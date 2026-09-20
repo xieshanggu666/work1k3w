@@ -24,8 +24,11 @@ const asked = ref('')
 const thinking = ref(false)
 const answered = ref(false)
 const answer = ref('')
-const cites = ref([])
-const related = ref([])
+// 命中结果只存文档 id + 分数：正文片段展示时统一走可读 cites 计算属性，
+// 授权撤销/到期后受限文档即时从引用与相关条目中移除，不在页面上残留受限正文
+const hitIds = ref([])
+const hitScoreMap = ref({})
+// 建议提示
 const suggestions = ['Vue 如何初始化项目?', 'Dexie 怎么进行查询?', '权限模型里有哪些角色?', '新成员入职流程是什么?']
 
 // ---- 缺口工单联动 ----
@@ -33,6 +36,25 @@ const gapFormOpen = ref(false)
 const gapDetail = ref('')
 
 const docById = computed(() => Object.fromEntries(kb.docs.map((d) => [d.id, d])))
+// 引用/相关条目在每次读取时重新过权限：依赖 kb.docs 与授权表（含响应式到期时钟），
+// 撤销、到期、跨窗口收回都会让已展示的问答结果同步剔除受限文档
+const visibleHits = computed(() => hitIds.value
+  .map((id) => docById.value[id])
+  .filter((d) => d && canViewDoc(d, auth.user?.id, null, accessStore.grantOf(d.id, auth.user?.id)))
+)
+const cites = computed(() => visibleHits.value.slice(0, 3).map((d) => {
+  const keywords = extractKeywords(asked.value)
+  const bodyText = stripHtml(d.body)
+  return {
+    ...d,
+    bodyText,
+    snippet: extractSnippet(d.body, keywords),
+    score: hitScoreMap.value[d.id] ?? 0
+  }
+}))
+const related = computed(() => visibleHits.value.slice(3, 7))
+// 回答后有权限命中但当前已全部被收回：给出明确提示，避免静默空白
+const allWithdrawn = computed(() => answered.value && hitIds.value.length > 0 && visibleHits.value.length === 0)
 // 当前问题是否已有未解决工单（创建后/已存在都会命中，避免重复提交）
 const activeTicket = computed(() => (asked.value ? gapStore.activeTicketForQuestion(asked.value) : null))
 // 已解决工单中匹配本问题的答案来源（审批发布后自动回填，此处对提问者可见）
@@ -62,38 +84,32 @@ function answering() {
   thinking.value = true
   answered.value = false
   answer.value = ''
-  cites.value = []
-  related.value = []
+  hitIds.value = []
+  hitScoreMap.value = {}
   gapFormOpen.value = false
   gapDetail.value = ''
 
   setTimeout(() => {
     const keywords = extractKeywords(asked.value)
     const tagNames = kb.tags
-    // 权限：撤销/到期的授权文档不再作为问答引用来源
+    // 权限：撤销/到期的授权文档不作为问答引用来源；展示阶段 cites/related 仍会再次过滤
     const hits = kb.docs.filter((d) => canViewDoc(d, auth.user?.id, null, accessStore.grantOf(d.id, auth.user?.id))).map((d) => ({
       doc: d,
       bodyText: stripHtml(d.body),
       score: scoreDoc(d, keywords, tagNames, stripHtml(d.body))
     })).filter((x) => x.score > 0).sort((a, b) => b.score - a.score)
 
-    const top = hits[0]
-    if (!top) {
+    if (!hits.length) {
       answered.value = true
       answer.value = '很抱歉，知识库中暂时没有与「' + asked.value + '」直接匹配的内容。建议你换一种表述，或浏览文档库 / 使用全局搜索。'
+      thinking.value = false
       return
     }
 
     answer.value = '基于知识库检索，我找到与「' + asked.value + '」相关的内容，引用来源如下。' + (hits.length > 1 ? ' 我对其归纳后优先展示最相关的 ' + Math.min(hits.length, 3) + ' 篇文档。' : '')
-    cites.value = hits.slice(0, 3).map((h) => ({
-      ...h.doc,
-      bodyText: h.bodyText,
-      snippet: extractSnippet(h.doc.body, keywords),
-      score: h.score
-    }))
-    related.value = hits.slice(3, 7).map((h) => h.doc)
+    hitScoreMap.value = Object.fromEntries(hits.map((h) => [h.doc.id, h.score]))
+    hitIds.value = hits.map((h) => h.doc.id)
     thinking.value = false
-    answered.value = true
   }, 600)
 }
 
@@ -121,6 +137,11 @@ watch(() => route.query.q, (v) => { if (v) { question.value = v; ask(v) } }, { i
     <div v-if="answered" class="answer card">
       <div class="a-label">助手回答<span class="sub-ask">问题：{{ asked }}</span></div>
       <p class="a-text">{{ answer }}</p>
+
+      <!-- 授权在回答后被撤销/到期：引用正文即时收回，给出明确提示 -->
+      <div v-if="allWithdrawn" class="withdrawn">
+        🔒 本次回答引用的文档授权已失效（被撤销或已到期），相关正文已收回。可前往文档详情重新申请访问。
+      </div>
 
       <div v-if="cites.length" class="cites">
         <div class="block-title">📎 引用出处</div>
@@ -198,6 +219,7 @@ watch(() => route.query.q, (v) => { if (v) { question.value = v; ask(v) } }, { i
 .a-label { font-weight: 700; font-size: 15px; display: flex; align-items: center; gap: 10px; }
 .sub-ask { font-weight: 400; font-size: 12px; color: var(--text-3); }
 .a-text { margin: 8px 0 18px; color: var(--text); }
+.withdrawn { margin: 0 0 14px; padding: 10px 14px; border-radius: 8px; font-size: 13px; color: #b91c1c; background: #fef2f2; border: 1px solid #fecaca; }
 .block-title { font-weight: 600; font-size: 13px; color: var(--text-2); margin: 16px 0 10px; }
 .cites { display: flex; flex-direction: column; gap: 10px; }
 .cite { border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; cursor: pointer; }

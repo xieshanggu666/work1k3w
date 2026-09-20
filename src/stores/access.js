@@ -1,8 +1,22 @@
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { db } from '@/db'
 import { uid } from '@/utils/format'
 import { ACCESS, ACCESS_PERM, isGrantActive, calcExpiresAt, buildAccessTimelineEntry } from '@/utils/access'
+
+// 跨标签页广播授权变化（撤销 / 审批 / 取消 / 到期留痕）：
+// 其他窗口收到后立即重读库，让详情、搜索、问答中已缓存的受限内容同步失效。
+// 不支持 BroadcastChannel 的环境（Node 测试）降级为不广播，逻辑不受影响。
+const CHANNEL_NAME = 'kb-access-changed'
+let channel = null
+function getChannel() {
+  if (channel !== null || typeof BroadcastChannel === 'undefined') return channel
+  channel = new BroadcastChannel(CHANNEL_NAME)
+  return channel
+}
+function notifyAccessChanged() {
+  getChannel()?.postMessage({ at: Date.now() })
+}
 
 // 文档访问申请 store：
 // 成员访问受限文档 → 提交限时阅读/协作申请（pending）→ 拥有者/管理员审批：
@@ -14,12 +28,59 @@ export const useAccessStore = defineStore('access', () => {
   const requests = ref([])
   const loaded = ref(false)
 
-  async function loadAll() {
-    if (loaded.value) return
+  // 响应式时钟：到期是纯时间流逝（记录状态不变），必须有随时间推进的响应式依赖，
+  // 否则 activeGrantMap / 各页面 computed 不会在到期时刻重算，详情/搜索/问答会继续泄露正文。
+  const clock = ref(Date.now())
+  let expireTimer = null
+  let fallbackTimer = null
+  let listenersBound = false
+
+  // 在最近一条授权到期的时刻推进时钟，并兜底每 30s 校准一次（休眠/计时漂移）
+  function scheduleExpiryTick() {
+    if (typeof setTimeout === 'undefined' || typeof clearTimeout === 'undefined') return
+    clearTimeout(expireTimer)
+    expireTimer = null
+    const wait = nextExpiryAt.value ? Math.max(250, nextExpiryAt.value - Date.now()) : 30000
+    expireTimer = setTimeout(onExpiryTick, wait)
+    if (!fallbackTimer) fallbackTimer = setInterval(() => { clock.value = Date.now() }, 30000)
+  }
+
+  async function onExpiryTick() {
+    expireTimer = null
+    clock.value = Date.now()
+    // 到期记录补「到期收回」留痕并重读库；无到期记录则只推进时钟驱动各 computed 重算
+    if (loaded.value) await sweepExpired()
+    scheduleExpiryTick()
+  }
+
+  // 跨窗口 / 本窗口重新可见：重读库并推进时钟，让撤销、审批、到期即时反映到所有页面
+  async function syncExternalChanges() {
+    if (!loaded.value) return
+    clock.value = Date.now()
     await reload()
-    loaded.value = true
-    // 扫描历史授权：惰性到期的记录补一条到期留痕（不改变状态，授权以 isGrantActive 判定）
     await sweepExpired()
+  }
+
+  function bindGlobalListeners() {
+    if (listenersBound || typeof window === 'undefined') return
+    listenersBound = true
+    getChannel()?.addEventListener('message', () => { syncExternalChanges() })
+    // BroadcastChannel 失效（如隐身模式）或同源存储被直接改动时，窗口重新可见即校准
+    window.addEventListener('focus', () => { syncExternalChanges() })
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) syncExternalChanges()
+    })
+  }
+
+  async function loadAll() {
+    if (!loaded.value) {
+      await reload()
+      loaded.value = true
+      // 扫描历史授权：惰性到期的记录补一条到期留痕（不改变状态，授权以 isGrantActive 判定）
+      await sweepExpired()
+    }
+    bindGlobalListeners()
+    scheduleExpiryTick()
   }
 
   async function reload() {
@@ -39,15 +100,33 @@ export const useAccessStore = defineStore('access', () => {
     return r || null
   }
 
-  // [docId+userId] -> 有效授权记录，供列表/搜索/问答批量过滤
+  // [docId+userId] -> 有效授权记录，供列表/搜索/问答批量过滤。
+  // 依赖 clock：授权到期时（无任何数据变更）映射也会重算，受限文档同步从各页面收回
   const activeGrantMap = computed(() => {
+    const now = new Date(clock.value)
     const m = {}
-    const now = new Date()
     for (const r of requests.value) {
       if (isGrantActive(r, now)) m[r.docId + '+' + r.applicantId] = r
     }
     return m
   })
+
+  // 最近一条待到期授权的时间戳，用于精准安排到期时钟（无需高频轮询）
+  const nextExpiryAt = computed(() => {
+    const now = clock.value
+    let next = null
+    for (const r of requests.value) {
+      if (r.status !== ACCESS.APPROVED || r.revokedAt) continue
+      const exp = r.grant?.expiresAt || r.expiresAt
+      if (!exp) continue
+      const t = new Date(exp).getTime()
+      if (t > now && (next === null || t < next)) next = t
+    }
+    return next
+  })
+
+  // 授权集合或到期点变化时重新排钟（loadAll 之后才启动，测试环境不挂定时器）
+  watch(nextExpiryAt, () => { if (loaded.value) scheduleExpiryTick() })
 
   function grantOf(docId, userId) {
     return activeGrantMap.value[docId + '+' + userId] || null
@@ -128,6 +207,7 @@ export const useAccessStore = defineStore('access', () => {
     })
 
     await reload()
+    if (result.status === 'ok') notifyAccessChanged()
     return result
   }
 
@@ -199,6 +279,7 @@ export const useAccessStore = defineStore('access', () => {
     })
 
     await Promise.all([reload(), kb.reloadDocs()])
+    if (result.status === 'ok') notifyAccessChanged()
     return result
   }
 
@@ -232,6 +313,7 @@ export const useAccessStore = defineStore('access', () => {
     })
 
     await Promise.all([reload(), kb.reloadDocs()])
+    if (result.status === 'ok') notifyAccessChanged()
     return result
   }
 
@@ -256,18 +338,21 @@ export const useAccessStore = defineStore('access', () => {
     })
 
     await reload()
+    if (result.status === 'ok') notifyAccessChanged()
     return result
   }
 
   // 惰性到期扫描：已通过但超过有效期的授权补「到期收回」留痕（每条仅补一次）。
-  // 状态不改变——各处以 isGrantActive 判定，授权在到期时刻即已不可用
+  // 状态不改变——各处以 isGrantActive 判定，授权在到期时刻即已不可用。
+  // 返回本次是否实际补写了留痕（据此决定是否广播，避免跨窗口空转接力）
   async function sweepExpired() {
     const now = new Date()
     const nowIso = now.toISOString()
     const due = requests.value.filter(
       (r) => r.status === ACCESS.APPROVED && !r.revokedAt && r.grant?.expiresAt && new Date(r.grant.expiresAt) <= now
     )
-    if (!due.length) return
+    if (!due.length) return false
+    let changed = false
     await db.transaction('rw', db.accessRequests, async () => {
       for (const r of due) {
         const fresh = await db.accessRequests.get(r.id)
@@ -277,19 +362,29 @@ export const useAccessStore = defineStore('access', () => {
         await db.accessRequests.update(r.id, {
           timeline: [...(fresh.timeline || []), buildAccessTimelineEntry('expire', 'system', '授权到期，阅读与协作权限已自动收回', nowIso)]
         })
+        changed = true
       }
     })
-    await reload()
+    if (changed) {
+      await reload()
+      clock.value = Date.now()
+      notifyAccessChanged()
+    }
+    return changed
   }
 
   // 删除文档时连带清理访问申请（拥有者删除文档，申请与授权一并失效）
   async function deleteRequestsOfDoc(docId) {
     await db.accessRequests.where('docId').equals(docId).delete()
-    if (loaded.value) await reload()
+    if (loaded.value) {
+      await reload()
+      clock.value = Date.now()
+      notifyAccessChanged()
+    }
   }
 
   return {
-    requests, loaded, loadAll, reload,
+    requests, loaded, clock, loadAll, reload, syncExternalChanges,
     activeGrantMap, grantOf, activeGrantFor, latestRequestFor, requestsOfDoc,
     requestsByUser, pendingForApprover, pendingCount,
     createRequest, decideRequest, revokeGrant, cancelRequest, sweepExpired, deleteRequestsOfDoc

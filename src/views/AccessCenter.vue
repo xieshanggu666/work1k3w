@@ -50,7 +50,8 @@ const counts = computed(() => ({
   all: list.value.length
 }))
 
-const now = ref(new Date())
+// 授权到期状态依赖 access store 的响应式时钟，到期时刻徽标/撤销按钮即时更新
+const now = computed(() => new Date(accessStore.clock))
 function active(r) { return isGrantActive(r, now.value) }
 
 function durationOf(r) { return durationMap.value[r.id] || ACCESS_DURATIONS[1].value }

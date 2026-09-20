@@ -23,12 +23,11 @@ const justDone = ref('')
 const all = computed(() => accessStore.requestsOfDoc(props.doc.id))
 const pendingList = computed(() => all.value.filter((r) => r.status === ACCESS.PENDING))
 // 生效中的授权（含已到期但记录仍为 approved 的，按当前时间区分提示）
-const grants = computed(() => {
-  const now = new Date()
-  return all.value
+const grants = computed(() =>
+  all.value
     .filter((r) => r.status === ACCESS.APPROVED)
     .sort((a, b) => new Date(b.decidedAt || b.grant?.grantedAt) - new Date(a.decidedAt || a.grant?.grantedAt))
-})
+)
 const history = computed(() => all.value.filter((r) => [ACCESS.REJECTED, ACCESS.CANCELLED, ACCESS.REVOKED].includes(r.status)))
 
 const userById = computed(() => Object.fromEntries(auth.users.map((u) => [u.id, u])))
@@ -36,8 +35,10 @@ const userById = computed(() => Object.fromEntries(auth.users.map((u) => [u.id, 
 function durationOf(r) {
   return durationMap.value[r.id] || ACCESS_DURATIONS[1].value
 }
+// 到期判定随 access store 的响应式时钟更新：到期时刻「生效中」自动切为「已到期」，撤销按钮同步消失
+const now = computed(() => new Date(accessStore.clock))
 function isExpired(r) {
-  return !!r.grant?.expiresAt && new Date(r.grant.expiresAt) <= new Date()
+  return !!r.grant?.expiresAt && new Date(r.grant.expiresAt) <= now.value
 }
 
 async function decide(r, decision) {
@@ -124,7 +125,7 @@ async function revoke(r) {
           <span v-else class="st st-ok">生效中</span>
           <span class="tm">{{ grantExpireText(r) }}</span>
           <button
-            v-if="canRevokeAccess(r, doc, auth.user?.id, auth.user?.role)"
+            v-if="canRevokeAccess(r, doc, auth.user?.id, auth.user?.role, now)"
             class="btn sm danger ms-auto" :disabled="busyId === r.id" @click="revoke(r)"
           >撤销授权</button>
         </div>
