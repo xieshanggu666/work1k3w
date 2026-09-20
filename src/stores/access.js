@@ -9,10 +9,18 @@ import { ACCESS, ACCESS_PERM, isGrantActive, calcExpiresAt, buildAccessTimelineE
 // 通过（approved）生成带有效期的授权快照 grant；驳回（rejected）不授权；申请人可取消（cancelled）。
 // 授权可被拥有者提前撤销（revoked）；到期为惰性判定（记录仍为 approved，判定/扫描时视为失效）。
 // 详情、搜索、问答、编辑四处统一以 isGrantActive 校验授权，撤销/到期即时同步收回。
+// 失效统一由响应式时钟 now 驱动：调度器在最近一个授权到期点推进时钟，
+// activeGrantMap 随之重算，详情/列表/搜索/问答等页面的受限内容即时收回，无需刷新。
 // 申请与授权变更全程记录在 timeline，记录不随撤销/到期删除。
 export const useAccessStore = defineStore('access', () => {
   const requests = ref([])
   const loaded = ref(false)
+  // 响应式当前时间：授权有效性判定（isGrantActive）统一以它为准。
+  // 审批/撤销/到期调度都会推进它，使各页面的授权缓存（computed）同步失效
+  const now = ref(new Date())
+  let expiryTimer = null
+  // setTimeout 延迟上限（2^31-1 ms），超过会溢出立即触发，长到期时间需分段调度
+  const MAX_TIMER_DELAY = 2147483647
 
   async function loadAll() {
     if (loaded.value) return
@@ -24,6 +32,34 @@ export const useAccessStore = defineStore('access', () => {
 
   async function reload() {
     requests.value = await db.accessRequests.toArray()
+    now.value = new Date()
+    scheduleExpiry()
+  }
+
+  // 调度下一次到期唤醒：找到生效中授权的最近到期点，到点推进时钟并补到期留痕。
+  // requests 变化（审批/撤销/加载）后重排，保证页面停留期间授权到期也能即时失效
+  function scheduleExpiry() {
+    if (expiryTimer) { clearTimeout(expiryTimer); expiryTimer = null }
+    const t = now.value.getTime()
+    let next = Infinity
+    for (const r of requests.value) {
+      if (r.status !== ACCESS.APPROVED || r.revokedAt || !r.grant?.expiresAt) continue
+      const exp = new Date(r.grant.expiresAt).getTime()
+      if (exp > t && exp < next) next = exp
+    }
+    if (next === Infinity) return
+    // 稍过到期点再判定，避免边界误差；超长延迟分段调度
+    const delay = Math.min(Math.max(next - Date.now(), 0) + 50, MAX_TIMER_DELAY)
+    expiryTimer = setTimeout(onExpiryTick, delay)
+  }
+
+  async function onExpiryTick() {
+    expiryTimer = null
+    // 推进时钟 → activeGrantMap 重算 → 详情/搜索/问答/列表的受限内容即时收回
+    now.value = new Date()
+    // 补「到期收回」留痕（幂等，每条授权仅补一次）
+    await sweepExpired()
+    scheduleExpiry()
   }
 
   // 当前用户在某文档上的最新一条申请记录（无论状态，供申请页/详情页展示）
@@ -34,17 +70,17 @@ export const useAccessStore = defineStore('access', () => {
   }
 
   // 当前用户在某文档上的有效授权记录（无则 null）——详情/搜索/问答/编辑统一入口
-  function activeGrantFor(docId, userId, now) {
-    const r = requests.value.find((x) => x.docId === docId && x.applicantId === userId && isGrantActive(x, now))
+  function activeGrantFor(docId, userId, at) {
+    const r = requests.value.find((x) => x.docId === docId && x.applicantId === userId && isGrantActive(x, at || now.value))
     return r || null
   }
 
-  // [docId+userId] -> 有效授权记录，供列表/搜索/问答批量过滤
+  // [docId+userId] -> 有效授权记录，供列表/搜索/问答批量过滤。
+  // 依赖响应式时钟 now：授权到期调度推进时钟后，此处自动重算，各页面缓存同步失效
   const activeGrantMap = computed(() => {
     const m = {}
-    const now = new Date()
     for (const r of requests.value) {
-      if (isGrantActive(r, now)) m[r.docId + '+' + r.applicantId] = r
+      if (isGrantActive(r, now.value)) m[r.docId + '+' + r.applicantId] = r
     }
     return m
   })
@@ -289,7 +325,7 @@ export const useAccessStore = defineStore('access', () => {
   }
 
   return {
-    requests, loaded, loadAll, reload,
+    requests, loaded, now, loadAll, reload,
     activeGrantMap, grantOf, activeGrantFor, latestRequestFor, requestsOfDoc,
     requestsByUser, pendingForApprover, pendingCount,
     createRequest, decideRequest, revokeGrant, cancelRequest, sweepExpired, deleteRequestsOfDoc

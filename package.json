@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "test:gap": "mkdir -p node_modules/.cache && esbuild scripts/run-gap-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/gap-test.mjs --alias:@=./src && node node_modules/.cache/gap-test.mjs",
     "test:restore": "mkdir -p node_modules/.cache && esbuild scripts/run-restore-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/restore-test.mjs --alias:@=./src && node node_modules/.cache/restore-test.mjs",
-    "test:perm": "mkdir -p node_modules/.cache && esbuild scripts/run-permission-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/permission-test.mjs --alias:@=./src && node node_modules/.cache/permission-test.mjs"
+    "test:perm": "mkdir -p node_modules/.cache && esbuild scripts/run-permission-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/permission-test.mjs --alias:@=./src && node node_modules/.cache/permission-test.mjs",
+    "test:access": "mkdir -p node_modules/.cache && esbuild scripts/run-access-expiry-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/access-expiry-test.mjs --alias:@=./src && node node_modules/.cache/access-expiry-test.mjs"
   },
   "dependencies": {
     "dexie": "^4.0.8",

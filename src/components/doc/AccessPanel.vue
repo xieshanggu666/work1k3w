@@ -22,9 +22,8 @@ const justDone = ref('')
 
 const all = computed(() => accessStore.requestsOfDoc(props.doc.id))
 const pendingList = computed(() => all.value.filter((r) => r.status === ACCESS.PENDING))
-// 生效中的授权（含已到期但记录仍为 approved 的，按当前时间区分提示）
+// 生效中的授权（含已到期但记录仍为 approved 的，按统一时钟区分提示）
 const grants = computed(() => {
-  const now = new Date()
   return all.value
     .filter((r) => r.status === ACCESS.APPROVED)
     .sort((a, b) => new Date(b.decidedAt || b.grant?.grantedAt) - new Date(a.decidedAt || a.grant?.grantedAt))
@@ -36,8 +35,9 @@ const userById = computed(() => Object.fromEntries(auth.users.map((u) => [u.id, 
 function durationOf(r) {
   return durationMap.value[r.id] || ACCESS_DURATIONS[1].value
 }
+// 到期判定接入 access store 统一时钟：到期调度推进后「已到期」标记即时刷新
 function isExpired(r) {
-  return !!r.grant?.expiresAt && new Date(r.grant.expiresAt) <= new Date()
+  return !!r.grant?.expiresAt && new Date(r.grant.expiresAt) <= accessStore.now
 }
 
 async function decide(r, decision) {

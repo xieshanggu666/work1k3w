@@ -24,9 +24,24 @@ const asked = ref('')
 const thinking = ref(false)
 const answered = ref(false)
 const answer = ref('')
-const cites = ref([])
-const related = ref([])
+// 提问时刻的原始检索命中（含受限文档正文片段）；展示层按当前授权实时过滤——
+// 授权撤销/到期后，受限引用与正文片段即时从已渲染答案中收回，不依赖重新提问
+const rawCites = ref([])
+const rawRelated = ref([])
 const suggestions = ['Vue 如何初始化项目?', 'Dexie 怎么进行查询?', '权限模型里有哪些角色?', '新成员入职流程是什么?']
+
+// 展示用引用/相关条目：随授权记录与到期时钟响应式重算，被收回的受限内容即时消失
+const cites = computed(() => rawCites.value.filter((c) => canViewDoc(c, auth.user?.id, null, accessStore.grantOf(c.id, auth.user?.id))))
+const related = computed(() => rawRelated.value.filter((d) => canViewDoc(d, auth.user?.id, null, accessStore.grantOf(d.id, auth.user?.id))))
+// 已渲染答案中被收回的受限引用数（授权撤销/到期导致）
+const revokedCount = computed(() => rawCites.value.length - cites.value.length)
+// 答案文案：引用全部被收回时，不再保留「找到相关内容」的原始表述
+const answerText = computed(() => {
+  if (revokedCount.value && !cites.value.length) {
+    return '该问题此前命中的内容来自限时授权文档，授权已撤销或到期，相关正文已同步收回。如需继续查看，请重新申请访问后再提问。'
+  }
+  return answer.value
+})
 
 // ---- 缺口工单联动 ----
 const gapFormOpen = ref(false)
@@ -62,8 +77,8 @@ function answering() {
   thinking.value = true
   answered.value = false
   answer.value = ''
-  cites.value = []
-  related.value = []
+  rawCites.value = []
+  rawRelated.value = []
   gapFormOpen.value = false
   gapDetail.value = ''
 
@@ -85,13 +100,13 @@ function answering() {
     }
 
     answer.value = '基于知识库检索，我找到与「' + asked.value + '」相关的内容，引用来源如下。' + (hits.length > 1 ? ' 我对其归纳后优先展示最相关的 ' + Math.min(hits.length, 3) + ' 篇文档。' : '')
-    cites.value = hits.slice(0, 3).map((h) => ({
+    rawCites.value = hits.slice(0, 3).map((h) => ({
       ...h.doc,
       bodyText: h.bodyText,
       snippet: extractSnippet(h.doc.body, keywords),
       score: h.score
     }))
-    related.value = hits.slice(3, 7).map((h) => h.doc)
+    rawRelated.value = hits.slice(3, 7).map((h) => h.doc)
     thinking.value = false
     answered.value = true
   }, 600)
@@ -120,7 +135,8 @@ watch(() => route.query.q, (v) => { if (v) { question.value = v; ask(v) } }, { i
 
     <div v-if="answered" class="answer card">
       <div class="a-label">助手回答<span class="sub-ask">问题：{{ asked }}</span></div>
-      <p class="a-text">{{ answer }}</p>
+      <p class="a-text">{{ answerText }}</p>
+      <div v-if="revokedCount" class="revoked-note">🔒 {{ revokedCount }} 条引用来自限时授权文档，授权已撤销或到期，相关正文已同步收回</div>
 
       <div v-if="cites.length" class="cites">
         <div class="block-title">📎 引用出处</div>
@@ -198,6 +214,7 @@ watch(() => route.query.q, (v) => { if (v) { question.value = v; ask(v) } }, { i
 .a-label { font-weight: 700; font-size: 15px; display: flex; align-items: center; gap: 10px; }
 .sub-ask { font-weight: 400; font-size: 12px; color: var(--text-3); }
 .a-text { margin: 8px 0 18px; color: var(--text); }
+.revoked-note { margin: -8px 0 14px; padding: 8px 14px; border-radius: 8px; font-size: 13px; color: #b45309; background: #fffbeb; border: 1px solid #f59e0b; }
 .block-title { font-weight: 600; font-size: 13px; color: var(--text-2); margin: 16px 0 10px; }
 .cites { display: flex; flex-direction: column; gap: 10px; }
 .cite { border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; cursor: pointer; }

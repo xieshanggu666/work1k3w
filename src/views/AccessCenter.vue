@@ -50,7 +50,8 @@ const counts = computed(() => ({
   all: list.value.length
 }))
 
-const now = ref(new Date())
+// 与 access store 统一时钟：授权到期调度推进后，本页「生效中/已到期」展示同步刷新
+const now = computed(() => accessStore.now)
 function active(r) { return isGrantActive(r, now.value) }
 
 function durationOf(r) { return durationMap.value[r.id] || ACCESS_DURATIONS[1].value }
